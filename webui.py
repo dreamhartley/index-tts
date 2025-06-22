@@ -1,7 +1,7 @@
 import json
 import os
 import sys
-import threading
+import asyncio
 import time
 
 import warnings
@@ -58,15 +58,38 @@ with open("tests/cases.jsonl", "r", encoding="utf-8") as f:
         example_cases.append([os.path.join("tests", example.get("prompt_audio", "sample_prompt.wav")),
                               example.get("text"), ["普通推理", "批次推理"][example.get("infer_mode", 0)]])
 
-def gen_single(prompt, text, infer_mode, max_text_tokens_per_sentence=120, sentences_bucket_max_size=4,
-                *args, progress=gr.Progress()):
-    output_path = None
-    if not output_path:
-        output_path = os.path.join("outputs", f"spk_{int(time.time())}.wav")
-    # set gradio progress
+# --- 优化核心 ---
+# 将同步的、耗时的TTS推理函数封装起来，以便在异步函数中调用
+def run_blocking_inference(infer_mode, prompt, text, output_path, verbose, max_text_tokens_per_sentence, sentences_bucket_max_size, kwargs):
+    """
+    这是一个同步函数，包含了耗时的模型推理操作。
+    它将被 asyncio.to_thread 在一个单独的线程中运行，以避免阻塞Gradio的UI线程。
+    """
+    if infer_mode == "普通推理":
+        output = tts.infer(prompt, text, output_path, verbose=verbose,
+                           max_text_tokens_per_sentence=int(max_text_tokens_per_sentence),
+                           **kwargs)
+    else: # 批次推理
+        output = tts.infer_fast(prompt, text, output_path, verbose=verbose,
+                                max_text_tokens_per_sentence=int(max_text_tokens_per_sentence),
+                                sentences_bucket_max_size=(sentences_bucket_max_size),
+                                **kwargs)
+    return output
+
+async def gen_single(prompt, text, infer_mode, max_text_tokens_per_sentence=120, sentences_bucket_max_size=4,
+                     *args, progress=gr.Progress()):
+    """
+    这是Gradio事件的异步处理函数。
+    它会调用上面的同步函数，但使用await asyncio.to_thread，这样UI就不会被卡住。
+    """
+    output_path = os.path.join("outputs", f"spk_{int(time.time())}.wav")
+    
+    # 设置Gradio进度条
     tts.gr_progress = progress
+
     do_sample, top_p, top_k, temperature, \
         length_penalty, num_beams, repetition_penalty, max_mel_tokens = args
+    
     kwargs = {
         "do_sample": bool(do_sample),
         "top_p": float(top_p),
@@ -76,27 +99,56 @@ def gen_single(prompt, text, infer_mode, max_text_tokens_per_sentence=120, sente
         "num_beams": num_beams,
         "repetition_penalty": float(repetition_penalty),
         "max_mel_tokens": int(max_mel_tokens),
-        # "typical_sampling": bool(typical_sampling),
-        # "typical_mass": float(typical_mass),
     }
-    if infer_mode == "普通推理":
-        output = tts.infer(prompt, text, output_path, verbose=cmd_args.verbose,
-                           max_text_tokens_per_sentence=int(max_text_tokens_per_sentence),
-                           **kwargs)
-    else:
-        # 批次推理
-        output = tts.infer_fast(prompt, text, output_path, verbose=cmd_args.verbose,
-            max_text_tokens_per_sentence=int(max_text_tokens_per_sentence),
-            sentences_bucket_max_size=(sentences_bucket_max_size),
-            **kwargs)
-    return gr.update(value=output,visible=True)
+
+    # 使用 asyncio.to_thread 在一个新线程中运行耗时的阻塞操作
+    print("开始进行异步推理...")
+    output = await asyncio.to_thread(
+        run_blocking_inference,
+        infer_mode,
+        prompt,
+        text,
+        output_path,
+        cmd_args.verbose,
+        max_text_tokens_per_sentence,
+        sentences_bucket_max_size,
+        kwargs
+    )
+    print("异步推理完成。")
+    
+    return gr.update(value=output, visible=True)
 
 def update_prompt_audio():
     update_button = gr.update(interactive=True)
     return update_button
 
+# --- 分句逻辑封装 ---
+def process_text_for_preview(text, max_tokens_per_sentence):
+    """
+    将文本处理和分句的逻辑封装成一个独立的同步函数。
+    """
+    if text and len(text.strip()) > 0:
+        text_tokens_list = tts.tokenizer.tokenize(text)
+        sentences = tts.tokenizer.split_sentences(text_tokens_list, max_tokens_per_sentence=int(max_tokens_per_sentence))
+        data = []
+        for i, s in enumerate(sentences):
+            sentence_str = ''.join(s)
+            tokens_count = len(s)
+            data.append([i + 1, sentence_str, tokens_count])
+        return data
+    else:
+        return [["-", "-", "-"]]
+
+async def on_input_text_change(text, max_tokens_per_sentence):
+    """
+    异步处理文本变化事件，同样使用 to_thread 防止潜在的卡顿。
+    """
+    preview_data = await asyncio.to_thread(process_text_for_preview, text, max_tokens_per_sentence)
+    return gr.update(value=preview_data)
+
+
 with gr.Blocks(title="IndexTTS Demo") as demo:
-    mutex = threading.Lock()
+    # 移除了未使用的 mutex
     gr.HTML('''
     <h2><center>IndexTTS: An Industrial-Level Controllable and Efficient Zero-Shot Text-To-Speech System</h2>
     <h2><center>(一款工业级可控且高效的零样本文本转语音系统)</h2>
@@ -109,15 +161,12 @@ with gr.Blocks(title="IndexTTS Demo") as demo:
             os.makedirs("prompts",exist_ok=True)
             prompt_audio = gr.Audio(label="参考音频",key="prompt_audio",
                                     sources=["upload","microphone"],type="filepath")
-            prompt_list = os.listdir("prompts")
-            default = ''
-            if prompt_list:
-                default = prompt_list[0]
             with gr.Column():
                 input_text_single = gr.TextArea(label="文本",key="input_text_single", placeholder="请输入目标文本", info="当前模型版本{}".format(tts.model_version or "1.0"))
-                infer_mode = gr.Radio(choices=["普通推理", "批次推理"], label="推理模式",info="批次推理：更适合长句，性能翻倍",value="普通推理")        
-                gen_button = gr.Button("生成语音", key="gen_button",interactive=True)
+                infer_mode = gr.Radio(choices=["普通推理", "批次推理"], label="推理模式",info="批次推理：更适合长句，性能翻倍",value="普通推理")
+                gen_button = gr.Button("生成语音", key="gen_button",interactive=True, variant="primary")
             output_audio = gr.Audio(label="生成结果", visible=True,key="output_audio")
+
         with gr.Accordion("高级生成参数设置", open=False):
             with gr.Row():
                 with gr.Column(scale=1):
@@ -130,12 +179,10 @@ with gr.Blocks(title="IndexTTS Demo") as demo:
                         top_k = gr.Slider(label="top_k", minimum=0, maximum=100, value=30, step=1)
                         num_beams = gr.Slider(label="num_beams", value=3, minimum=1, maximum=10, step=1)
                     with gr.Row():
-                        repetition_penalty = gr.Number(label="repetition_penalty", precision=None, value=10.0, minimum=0.1, maximum=20.0, step=0.1)
-                        length_penalty = gr.Number(label="length_penalty", precision=None, value=0.0, minimum=-2.0, maximum=2.0, step=0.1)
+                        repetition_penalty = gr.Number(label="repetition_penalty", value=10.0)
+                        length_penalty = gr.Number(label="length_penalty", value=0.0)
                     max_mel_tokens = gr.Slider(label="max_mel_tokens", value=600, minimum=50, maximum=tts.cfg.gpt.max_mel_tokens, step=10, info="生成Token最大数量，过小导致音频被截断", key="max_mel_tokens")
-                    # with gr.Row():
-                    #     typical_sampling = gr.Checkbox(label="typical_sampling", value=False, info="不建议使用")
-                    #     typical_mass = gr.Slider(label="typical_mass", value=0.9, minimum=0.0, maximum=1.0, step=0.1)
+                
                 with gr.Column(scale=2):
                     gr.Markdown("**分句设置** _参数会影响音频质量和生成速度_")
                     with gr.Row():
@@ -153,11 +200,11 @@ with gr.Blocks(title="IndexTTS Demo") as demo:
                             key="sentences_preview",
                             wrap=True,
                         )
-            advanced_params = [
-                do_sample, top_p, top_k, temperature,
-                length_penalty, num_beams, repetition_penalty, max_mel_tokens,
-                # typical_sampling, typical_mass,
-            ]
+
+        advanced_params = [
+            do_sample, top_p, top_k, temperature,
+            length_penalty, num_beams, repetition_penalty, max_mel_tokens,
+        ]
         
         if len(example_cases) > 0:
             gr.Examples(
@@ -165,26 +212,7 @@ with gr.Blocks(title="IndexTTS Demo") as demo:
                 inputs=[prompt_audio, input_text_single, infer_mode],
             )
 
-    def on_input_text_change(text, max_tokens_per_sentence):
-        if text and len(text) > 0:
-            text_tokens_list = tts.tokenizer.tokenize(text)
-
-            sentences = tts.tokenizer.split_sentences(text_tokens_list, max_tokens_per_sentence=int(max_tokens_per_sentence))
-            data = []
-            for i, s in enumerate(sentences):
-                sentence_str = ''.join(s)
-                tokens_count = len(s)
-                data.append([i, sentence_str, tokens_count])
-            
-            return {
-                sentences_preview: gr.update(value=data, visible=True, type="array"),
-            }
-        else:
-            df = pd.DataFrame([], columns=["序号", "分句内容", "Token数"])
-            return {
-                sentences_preview: gr.update(value=df)
-            }
-
+    # --- 将事件绑定到新的异步函数 ---
     input_text_single.change(
         on_input_text_change,
         inputs=[input_text_single, max_text_tokens_per_sentence],
@@ -196,8 +224,8 @@ with gr.Blocks(title="IndexTTS Demo") as demo:
         outputs=[sentences_preview]
     )
     prompt_audio.upload(update_prompt_audio,
-                         inputs=[],
-                         outputs=[gen_button])
+                        inputs=[],
+                        outputs=[gen_button])
 
     gen_button.click(gen_single,
                      inputs=[prompt_audio, input_text_single, infer_mode,
@@ -208,5 +236,6 @@ with gr.Blocks(title="IndexTTS Demo") as demo:
 
 
 if __name__ == "__main__":
+    # queue方法对于异步应用依然重要，它能管理请求队列
     demo.queue(20)
-    demo.launch(server_name=cmd_args.host, server_port=cmd_args.port)
+    demo.launch(server_name=cmd_args.host, server_port=cmd_args.port,share=True)
