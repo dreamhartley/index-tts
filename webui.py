@@ -3,6 +3,7 @@ import os
 import sys
 import asyncio
 import time
+from functools import lru_cache
 
 import warnings
 warnings.filterwarnings("ignore", category=FutureWarning)
@@ -48,30 +49,70 @@ tts = IndexTTS(model_dir=cmd_args.model_dir, cfg_path=os.path.join(cmd_args.mode
 os.makedirs("outputs/tasks",exist_ok=True)
 os.makedirs("prompts",exist_ok=True)
 
-try:
-    with open("tests/cases.jsonl", "r", encoding="utf-8") as f:
-        example_cases = []
-        for line in f:
-            line = line.strip()
-            if not line:
-                continue
-            example = json.loads(line)
-            example_cases.append([os.path.join("tests", example.get("prompt_audio", "sample_prompt.wav")),
-                                  example.get("text"), ["普通推理", "批次推理"][example.get("infer_mode", 0)]])
-except FileNotFoundError:
+with open("tests/cases.jsonl", "r", encoding="utf-8") as f:
     example_cases = []
-    print("Warning: 'tests/cases.jsonl' not found. Examples will not be loaded.")
-
+    for line in f:
+        line = line.strip()
+        if not line:
+            continue
+        example = json.loads(line)
+        example_cases.append([os.path.join("tests", example.get("prompt_audio", "sample_prompt.wav")),
+                              example.get("text"), ["普通推理", "批次推理"][example.get("infer_mode", 0)]])
 
 # --- 优化核心 ---
-# 将同步的、耗时的TTS推理函数封装起来，以便在异步函数中调用
-def run_blocking_inference(infer_mode, prompt, text, output_path, verbose, max_text_tokens_per_sentence, sentences_bucket_max_size, kwargs, progress):
+# 防抖动装饰器
+class Debouncer:
+    def __init__(self, wait=0.5):
+        self.wait = wait
+        self.task = None
+        self.last_call_time = 0
+        
+    async def __call__(self, func, *args, **kwargs):
+        current_time = time.time()
+        self.last_call_time = current_time
+        
+        # 取消之前的任务
+        if self.task and not self.task.done():
+            self.task.cancel()
+        
+        async def delayed_execution():
+            await asyncio.sleep(self.wait)
+            # 检查是否是最后一次调用
+            if current_time == self.last_call_time:
+                return await func(*args, **kwargs)
+            return None
+        
+        self.task = asyncio.create_task(delayed_execution())
+        try:
+            result = await self.task
+            return result
+        except asyncio.CancelledError:
+            return None
+
+# 创建防抖动实例
+text_debouncer = Debouncer(wait=0.5)  # 500ms 防抖
+
+# 缓存分句结果
+@lru_cache(maxsize=128)
+def cached_tokenize_and_split(text, max_tokens_per_sentence):
+    """缓存分句结果，避免重复计算相同的文本"""
+    if not text or len(text.strip()) == 0:
+        return [["-", "-", "-"]]
+    
+    text_tokens_list = tts.tokenizer.tokenize(text)
+    sentences = tts.tokenizer.split_sentences(text_tokens_list, max_tokens_per_sentence=int(max_tokens_per_sentence))
+    data = []
+    for i, s in enumerate(sentences):
+        sentence_str = ''.join(s)
+        tokens_count = len(s)
+        data.append([i + 1, sentence_str, tokens_count])
+    return data
+
+def run_blocking_inference(infer_mode, prompt, text, output_path, verbose, max_text_tokens_per_sentence, sentences_bucket_max_size, kwargs):
     """
     这是一个同步函数，包含了耗时的模型推理操作。
     它将被 asyncio.to_thread 在一个单独的线程中运行，以避免阻塞Gradio的UI线程。
     """
-    # 将Gradio的progress对象传递给模型
-    tts.gr_progress = progress
     if infer_mode == "普通推理":
         output = tts.infer(prompt, text, output_path, verbose=verbose,
                            max_text_tokens_per_sentence=int(max_text_tokens_per_sentence),
@@ -86,14 +127,14 @@ def run_blocking_inference(infer_mode, prompt, text, output_path, verbose, max_t
 async def gen_single(prompt, text, infer_mode, max_text_tokens_per_sentence=120, sentences_bucket_max_size=4,
                      *args, progress=gr.Progress()):
     """
-    这是Gradio事件的异步生成器处理函数。
-    它首先禁用按钮，然后在新线程中运行推理，最后返回结果并重新启用按钮。
+    这是Gradio事件的异步处理函数。
+    它会调用上面的同步函数，但使用await asyncio.to_thread，这样UI就不会被卡住。
     """
-    # 1. 立即提供反馈：禁用按钮并清除旧输出
-    yield gr.update(interactive=False), gr.update(value=None, visible=False)
-
     output_path = os.path.join("outputs", f"spk_{int(time.time())}.wav")
     
+    # 设置Gradio进度条
+    tts.gr_progress = progress
+
     do_sample, top_p, top_k, temperature, \
         length_penalty, num_beams, repetition_penalty, max_mel_tokens = args
     
@@ -108,73 +149,59 @@ async def gen_single(prompt, text, infer_mode, max_text_tokens_per_sentence=120,
         "max_mel_tokens": int(max_mel_tokens),
     }
 
-    # 2. 在后台线程中执行耗时的推理任务
+    # 使用 asyncio.to_thread 在一个新线程中运行耗时的阻塞操作
     print("开始进行异步推理...")
-    try:
-        output = await asyncio.to_thread(
-            run_blocking_inference,
-            infer_mode,
-            prompt,
-            text,
-            output_path,
-            cmd_args.verbose,
-            max_text_tokens_per_sentence,
-            sentences_bucket_max_size,
-            kwargs,
-            progress
-        )
-        print("异步推理完成。")
-        # 3. 返回最终结果并重新启用按钮
-        yield gr.update(interactive=True), gr.update(value=output, visible=True)
-    except Exception as e:
-        print(f"推理时发生错误: {e}")
-        # 即使发生错误，也要重新启用按钮
-        yield gr.update(interactive=True), gr.update(value=None, visible=True, label=f"错误: {e}")
-
+    output = await asyncio.to_thread(
+        run_blocking_inference,
+        infer_mode,
+        prompt,
+        text,
+        output_path,
+        cmd_args.verbose,
+        max_text_tokens_per_sentence,
+        sentences_bucket_max_size,
+        kwargs
+    )
+    print("异步推理完成。")
+    
+    return gr.update(value=output, visible=True)
 
 def update_prompt_audio():
     update_button = gr.update(interactive=True)
     return update_button
 
-# --- 分句逻辑封装 ---
-def process_text_for_preview(text, max_tokens_per_sentence):
-    """
-    将文本处理和分句的逻辑封装成一个独立的同步函数。
-    """
-    if text and len(text.strip()) > 0:
-        text_tokens_list = tts.tokenizer.tokenize(text)
-        sentences = tts.tokenizer.split_sentences(text_tokens_list, max_tokens_per_sentence=int(max_tokens_per_sentence))
-        data = []
-        for i, s in enumerate(sentences):
-            sentence_str = ''.join(s)
-            tokens_count = len(s)
-            data.append([i + 1, sentence_str, tokens_count])
-        return data
-    else:
-        return [["-", "-", "-"]]
-
-async def on_input_text_change(text, max_tokens_per_sentence):
-    """
-    异步处理文本变化事件，同样使用 to_thread 防止潜在的卡顿。
-    """
-    preview_data = await asyncio.to_thread(process_text_for_preview, text, max_tokens_per_sentence)
+# --- 优化后的分句处理 ---
+async def process_text_for_preview_async(text, max_tokens_per_sentence):
+    """异步处理文本分句，使用缓存避免重复计算"""
+    # 使用缓存的分句函数
+    preview_data = await asyncio.to_thread(cached_tokenize_and_split, text, max_tokens_per_sentence)
     return gr.update(value=preview_data)
 
+async def on_input_text_change(text, max_tokens_per_sentence):
+    """使用防抖动处理文本变化事件"""
+    result = await text_debouncer(process_text_for_preview_async, text, max_tokens_per_sentence)
+    return result if result is not None else gr.update()
+
+# 手动预览按钮的处理函数（不需要防抖）
+async def manual_preview(text, max_tokens_per_sentence):
+    """手动触发预览，立即执行"""
+    return await process_text_for_preview_async(text, max_tokens_per_sentence)
 
 with gr.Blocks(title="IndexTTS Demo") as demo:
     gr.HTML('''
     <h2><center>IndexTTS: An Industrial-Level Controllable and Efficient Zero-Shot Text-To-Speech System</h2>
     <h2><center>(一款工业级可控且高效的零样本文本转语音系统)</h2>
 <p align="center">
-<a href='https://arxiv.org/abs/2502.05512' target='_blank'><img src='https://img.shields.io/badge/ArXiv-2502.05512-red'></a>
+<a href='https://arxiv.org/abs/2502.05512'><img src='https://img.shields.io/badge/ArXiv-2502.05512-red'></a>
 </p>
     ''')
     with gr.Tab("音频生成"):
         with gr.Row():
+            os.makedirs("prompts",exist_ok=True)
             prompt_audio = gr.Audio(label="参考音频",key="prompt_audio",
                                     sources=["upload","microphone"],type="filepath")
             with gr.Column():
-                input_text_single = gr.TextArea(label="文本",key="input_text_single", placeholder="请输入目标文本，按回车预览分句", info="当前模型版本{}".format(tts.model_version or "1.0"))
+                input_text_single = gr.TextArea(label="文本",key="input_text_single", placeholder="请输入目标文本", info="当前模型版本{}".format(tts.model_version or "1.0"))
                 infer_mode = gr.Radio(choices=["普通推理", "批次推理"], label="推理模式",info="批次推理：更适合长句，性能翻倍",value="普通推理")
                 gen_button = gr.Button("生成语音", key="gen_button",interactive=True, variant="primary")
             output_audio = gr.Audio(label="生成结果", visible=True,key="output_audio")
@@ -207,11 +234,14 @@ with gr.Blocks(title="IndexTTS Demo") as demo:
                             info="建议2-8之间，值越大，一批次推理包含的分句数越多，过大可能导致内存溢出",
                         )
                     with gr.Accordion("预览分句结果", open=True) as sentences_settings:
+                        with gr.Row():
+                            auto_preview = gr.Checkbox(label="自动预览", value=True, info="输入时自动更新预览")
+                            preview_button = gr.Button("手动预览", size="sm")
                         sentences_preview = gr.Dataframe(
                             headers=["序号", "分句内容", "Token数"],
                             key="sentences_preview",
                             wrap=True,
-                            interactive=False, # 设置为不可交互
+                            value=[["-", "-", "-"]]  # 初始值
                         )
 
         advanced_params = [
@@ -225,18 +255,28 @@ with gr.Blocks(title="IndexTTS Demo") as demo:
                 inputs=[prompt_audio, input_text_single, infer_mode],
             )
 
-    # --- 将事件绑定到新的异步函数和优化后的触发器 ---
+    # --- 优化后的事件绑定 ---
+    # 只在自动预览开启时才触发
+    def conditional_preview(text, max_tokens, auto_preview_enabled):
+        if auto_preview_enabled:
+            return on_input_text_change(text, max_tokens)
+        return gr.update()
     
-    # 当用户在文本框里按下回车时，触发分句预览
-    input_text_single.submit(
-        on_input_text_change,
-        inputs=[input_text_single, max_text_tokens_per_sentence],
+    input_text_single.change(
+        conditional_preview,
+        inputs=[input_text_single, max_text_tokens_per_sentence, auto_preview],
         outputs=[sentences_preview]
     )
     
-    # 当用户释放滑块时，触发分句预览
-    max_text_tokens_per_sentence.release(
-        on_input_text_change,
+    max_text_tokens_per_sentence.change(
+        conditional_preview,
+        inputs=[input_text_single, max_text_tokens_per_sentence, auto_preview],
+        outputs=[sentences_preview]
+    )
+    
+    # 手动预览按钮
+    preview_button.click(
+        manual_preview,
         inputs=[input_text_single, max_text_tokens_per_sentence],
         outputs=[sentences_preview]
     )
@@ -245,16 +285,15 @@ with gr.Blocks(title="IndexTTS Demo") as demo:
                         inputs=[],
                         outputs=[gen_button])
 
-    # 点击生成按钮，现在会更新按钮本身和音频输出
     gen_button.click(gen_single,
                      inputs=[prompt_audio, input_text_single, infer_mode,
                              max_text_tokens_per_sentence, sentences_bucket_max_size,
                              *advanced_params,
                      ],
-                     outputs=[gen_button, output_audio])
+                     outputs=[output_audio])
 
 
 if __name__ == "__main__":
     # queue方法对于异步应用依然重要，它能管理请求队列
-    demo.queue()
-    demo.launch(server_name=cmd_args.host, server_port=cmd_args.port, share=True)
+    demo.queue(20)
+    demo.launch(server_name=cmd_args.host, server_port=cmd_args.port,share=True)
