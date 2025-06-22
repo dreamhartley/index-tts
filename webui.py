@@ -4,6 +4,7 @@ import sys
 import asyncio
 import time
 from functools import lru_cache
+import threading
 
 import warnings
 warnings.filterwarnings("ignore", category=FutureWarning)
@@ -60,53 +61,48 @@ with open("tests/cases.jsonl", "r", encoding="utf-8") as f:
                               example.get("text"), ["普通推理", "批次推理"][example.get("infer_mode", 0)]])
 
 # --- 优化核心 ---
-# 防抖动装饰器
-class Debouncer:
+# 简单的防抖动实现
+class SimpleDebouncer:
     def __init__(self, wait=0.5):
         self.wait = wait
-        self.task = None
-        self.last_call_time = 0
+        self.timer = None
+        self.lock = threading.Lock()
         
-    async def __call__(self, func, *args, **kwargs):
-        current_time = time.time()
-        self.last_call_time = current_time
-        
-        # 取消之前的任务
-        if self.task and not self.task.done():
-            self.task.cancel()
-        
-        async def delayed_execution():
-            await asyncio.sleep(self.wait)
-            # 检查是否是最后一次调用
-            if current_time == self.last_call_time:
-                return await func(*args, **kwargs)
-            return None
-        
-        self.task = asyncio.create_task(delayed_execution())
-        try:
-            result = await self.task
-            return result
-        except asyncio.CancelledError:
-            return None
+    def debounce(self, func):
+        def debounced(*args, **kwargs):
+            with self.lock:
+                if self.timer:
+                    self.timer.cancel()
+                
+                def call_func():
+                    return func(*args, **kwargs)
+                
+                self.timer = threading.Timer(self.wait, call_func)
+                self.timer.start()
+        return debounced
 
 # 创建防抖动实例
-text_debouncer = Debouncer(wait=0.5)  # 500ms 防抖
+text_debouncer = SimpleDebouncer(wait=0.5)
 
-# 缓存分句结果
-@lru_cache(maxsize=128)
+# 缓存分句结果，限制缓存大小避免内存问题
+@lru_cache(maxsize=32)  # 减小缓存大小
 def cached_tokenize_and_split(text, max_tokens_per_sentence):
     """缓存分句结果，避免重复计算相同的文本"""
     if not text or len(text.strip()) == 0:
         return [["-", "-", "-"]]
     
-    text_tokens_list = tts.tokenizer.tokenize(text)
-    sentences = tts.tokenizer.split_sentences(text_tokens_list, max_tokens_per_sentence=int(max_tokens_per_sentence))
-    data = []
-    for i, s in enumerate(sentences):
-        sentence_str = ''.join(s)
-        tokens_count = len(s)
-        data.append([i + 1, sentence_str, tokens_count])
-    return data
+    try:
+        text_tokens_list = tts.tokenizer.tokenize(text)
+        sentences = tts.tokenizer.split_sentences(text_tokens_list, max_tokens_per_sentence=int(max_tokens_per_sentence))
+        data = []
+        for i, s in enumerate(sentences):
+            sentence_str = ''.join(s)
+            tokens_count = len(s)
+            data.append([i + 1, sentence_str, tokens_count])
+        return data
+    except Exception as e:
+        print(f"分句处理错误: {e}")
+        return [["-", "处理错误", "-"]]
 
 def run_blocking_inference(infer_mode, prompt, text, output_path, verbose, max_text_tokens_per_sentence, sentences_bucket_max_size, kwargs):
     """
@@ -164,28 +160,59 @@ async def gen_single(prompt, text, infer_mode, max_text_tokens_per_sentence=120,
     )
     print("异步推理完成。")
     
+    # 清理一些缓存，避免内存累积
+    if cached_tokenize_and_split.cache_info().currsize > 20:
+        cached_tokenize_and_split.cache_clear()
+    
     return gr.update(value=output, visible=True)
 
 def update_prompt_audio():
     update_button = gr.update(interactive=True)
     return update_button
 
-# --- 优化后的分句处理 ---
-async def process_text_for_preview_async(text, max_tokens_per_sentence):
-    """异步处理文本分句，使用缓存避免重复计算"""
-    # 使用缓存的分句函数
-    preview_data = await asyncio.to_thread(cached_tokenize_and_split, text, max_tokens_per_sentence)
-    return gr.update(value=preview_data)
+# --- 同步的分句处理函数 ---
+def process_text_for_preview(text, max_tokens_per_sentence):
+    """同步处理文本分句"""
+    preview_data = cached_tokenize_and_split(text, max_tokens_per_sentence)
+    return preview_data
 
-async def on_input_text_change(text, max_tokens_per_sentence):
-    """使用防抖动处理文本变化事件"""
-    result = await text_debouncer(process_text_for_preview_async, text, max_tokens_per_sentence)
-    return result if result is not None else gr.update()
+# 全局变量存储最后的预览结果
+last_preview_result = [["-", "-", "-"]]
+preview_lock = threading.Lock()
 
-# 手动预览按钮的处理函数（不需要防抖）
-async def manual_preview(text, max_tokens_per_sentence):
+def debounced_preview(text, max_tokens_per_sentence):
+    """防抖动的预览函数"""
+    global last_preview_result
+    try:
+        result = process_text_for_preview(text, max_tokens_per_sentence)
+        with preview_lock:
+            last_preview_result = result
+        return result
+    except Exception as e:
+        print(f"预览错误: {e}")
+        return last_preview_result
+
+# 使用装饰器创建防抖动版本
+debounced_preview_func = text_debouncer.debounce(debounced_preview)
+
+def on_input_text_change(text, max_tokens_per_sentence, auto_preview_enabled):
+    """处理文本变化事件"""
+    if not auto_preview_enabled:
+        return gr.update()
+    
+    # 立即返回上次的结果，避免UI卡顿
+    with preview_lock:
+        current_result = last_preview_result
+    
+    # 异步触发防抖动的预览计算
+    threading.Thread(target=debounced_preview_func, args=(text, max_tokens_per_sentence)).start()
+    
+    return current_result
+
+# 手动预览按钮的处理函数
+def manual_preview(text, max_tokens_per_sentence):
     """手动触发预览，立即执行"""
-    return await process_text_for_preview_async(text, max_tokens_per_sentence)
+    return process_text_for_preview(text, max_tokens_per_sentence)
 
 with gr.Blocks(title="IndexTTS Demo") as demo:
     gr.HTML('''
@@ -235,8 +262,8 @@ with gr.Blocks(title="IndexTTS Demo") as demo:
                         )
                     with gr.Accordion("预览分句结果", open=True) as sentences_settings:
                         with gr.Row():
-                            auto_preview = gr.Checkbox(label="自动预览", value=True, info="输入时自动更新预览")
-                            preview_button = gr.Button("手动预览", size="sm")
+                            auto_preview = gr.Checkbox(label="自动预览", value=False, info="输入时自动更新预览（可能影响输入流畅度）")
+                            preview_button = gr.Button("更新预览", size="sm")
                         sentences_preview = gr.Dataframe(
                             headers=["序号", "分句内容", "Token数"],
                             key="sentences_preview",
@@ -255,21 +282,15 @@ with gr.Blocks(title="IndexTTS Demo") as demo:
                 inputs=[prompt_audio, input_text_single, infer_mode],
             )
 
-    # --- 优化后的事件绑定 ---
-    # 只在自动预览开启时才触发
-    def conditional_preview(text, max_tokens, auto_preview_enabled):
-        if auto_preview_enabled:
-            return on_input_text_change(text, max_tokens)
-        return gr.update()
-    
+    # --- 事件绑定 ---
     input_text_single.change(
-        conditional_preview,
+        on_input_text_change,
         inputs=[input_text_single, max_text_tokens_per_sentence, auto_preview],
         outputs=[sentences_preview]
     )
     
     max_text_tokens_per_sentence.change(
-        conditional_preview,
+        on_input_text_change,
         inputs=[input_text_single, max_text_tokens_per_sentence, auto_preview],
         outputs=[sentences_preview]
     )
