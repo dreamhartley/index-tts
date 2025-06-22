@@ -13,7 +13,8 @@ pandas>=2.2.0,<3.0.0
 matplotlib==3.8.2
 opencv-python==4.9.0.80
 vocos==0.1.0
-tensorboard==2.9.1
+# 升级tensorboard以兼容新版protobuf
+tensorboard>=2.11.0,<2.15.0
 omegaconf
 sentencepiece
 librosa
