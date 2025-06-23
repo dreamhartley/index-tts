@@ -149,6 +149,8 @@ def process_text_for_preview(text, max_tokens_per_sentence, auto_preview_enabled
     preview_data = cached_tokenize_and_split(text, max_tokens_per_sentence)
     return preview_data
 
+
+
 with gr.Blocks(title="IndexTTS Demo") as demo:
     gr.HTML('''
     <h2><center>IndexTTS: An Industrial-Level Controllable and Efficient Zero-Shot Text-To-Speech System</h2>
@@ -232,7 +234,7 @@ with gr.Blocks(title="IndexTTS Demo") as demo:
     
     # 手动预览按钮
     preview_button.click(
-        lambda text, max_tokens: cached_tokenize_and_split(text, max_tokens),
+        manual_preview,
         inputs=[input_text_single, max_text_tokens_per_sentence],
         outputs=[sentences_preview]
     )
