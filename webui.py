@@ -166,7 +166,7 @@ with gr.Blocks(title="IndexTTS Demo") as demo:
                 input_text_single = gr.TextArea(label="文本",key="input_text_single", placeholder="请输入目标文本", info="当前模型版本{}".format(tts.model_version or "1.0"))
                 infer_mode = gr.Radio(choices=["普通推理", "批次推理"], label="推理模式",info="批次推理：更适合长句，性能翻倍",value="普通推理")
                 gen_button = gr.Button("生成语音", key="gen_button",interactive=True, variant="primary")
-            output_audio = gr.Audio(label="生成结果", visible=True,key="output_audio")
+            output_audio = gr.Audio(label="生成结果", type="filepath", visible=True,key="output_audio")
 
         with gr.Accordion("高级生成参数设置", open=False):
             with gr.Row():
