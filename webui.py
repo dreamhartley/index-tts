@@ -61,31 +61,8 @@ with open("tests/cases.jsonl", "r", encoding="utf-8") as f:
                               example.get("text"), ["普通推理", "批次推理"][example.get("infer_mode", 0)]])
 
 # --- 优化核心 ---
-# 简单的防抖动实现
-class SimpleDebouncer:
-    def __init__(self, wait=0.5):
-        self.wait = wait
-        self.timer = None
-        self.lock = threading.Lock()
-        
-    def debounce(self, func):
-        def debounced(*args, **kwargs):
-            with self.lock:
-                if self.timer:
-                    self.timer.cancel()
-                
-                def call_func():
-                    return func(*args, **kwargs)
-                
-                self.timer = threading.Timer(self.wait, call_func)
-                self.timer.start()
-        return debounced
-
-# 创建防抖动实例
-text_debouncer = SimpleDebouncer(wait=0.5)
-
 # 缓存分句结果，限制缓存大小避免内存问题
-@lru_cache(maxsize=32)  # 减小缓存大小
+@lru_cache(maxsize=128)
 def cached_tokenize_and_split(text, max_tokens_per_sentence):
     """缓存分句结果，避免重复计算相同的文本"""
     if not text or len(text.strip()) == 0:
@@ -161,58 +138,16 @@ async def gen_single(prompt, text, infer_mode, max_text_tokens_per_sentence=120,
     print("异步推理完成。")
     
     # 清理一些缓存，避免内存累积
-    if cached_tokenize_and_split.cache_info().currsize > 20:
-        cached_tokenize_and_split.cache_clear()
-    
     return gr.update(value=output, visible=True)
 
-def update_prompt_audio():
-    update_button = gr.update(interactive=True)
-    return update_button
 
 # --- 同步的分句处理函数 ---
-def process_text_for_preview(text, max_tokens_per_sentence):
+def process_text_for_preview(text, max_tokens_per_sentence, auto_preview_enabled):
+    if not auto_preview_enabled:
+        return gr.update(value=[["-", "自动预览已关闭", "-"]])
     """同步处理文本分句"""
     preview_data = cached_tokenize_and_split(text, max_tokens_per_sentence)
     return preview_data
-
-# 全局变量存储最后的预览结果
-last_preview_result = [["-", "-", "-"]]
-preview_lock = threading.Lock()
-
-def debounced_preview(text, max_tokens_per_sentence):
-    """防抖动的预览函数"""
-    global last_preview_result
-    try:
-        result = process_text_for_preview(text, max_tokens_per_sentence)
-        with preview_lock:
-            last_preview_result = result
-        return result
-    except Exception as e:
-        print(f"预览错误: {e}")
-        return last_preview_result
-
-# 使用装饰器创建防抖动版本
-debounced_preview_func = text_debouncer.debounce(debounced_preview)
-
-def on_input_text_change(text, max_tokens_per_sentence, auto_preview_enabled):
-    """处理文本变化事件"""
-    if not auto_preview_enabled:
-        return gr.update()
-    
-    # 立即返回上次的结果，避免UI卡顿
-    with preview_lock:
-        current_result = last_preview_result
-    
-    # 异步触发防抖动的预览计算
-    threading.Thread(target=debounced_preview_func, args=(text, max_tokens_per_sentence)).start()
-    
-    return current_result
-
-# 手动预览按钮的处理函数
-def manual_preview(text, max_tokens_per_sentence):
-    """手动触发预览，立即执行"""
-    return process_text_for_preview(text, max_tokens_per_sentence)
 
 with gr.Blocks(title="IndexTTS Demo") as demo:
     gr.HTML('''
@@ -283,28 +218,24 @@ with gr.Blocks(title="IndexTTS Demo") as demo:
             )
 
     # --- 事件绑定 ---
-    input_text_single.change(
-        on_input_text_change,
-        inputs=[input_text_single, max_text_tokens_per_sentence, auto_preview],
-        outputs=[sentences_preview]
-    )
-    
-    max_text_tokens_per_sentence.change(
-        on_input_text_change,
-        inputs=[input_text_single, max_text_tokens_per_sentence, auto_preview],
-        outputs=[sentences_preview]
-    )
+    # 预览更新事件
+    def bind_preview_events(triggers):
+        for trigger in triggers:
+            trigger.change(
+                process_text_for_preview,
+                inputs=[input_text_single, max_text_tokens_per_sentence, auto_preview],
+                outputs=[sentences_preview],
+                # every=0.5, # 每 0.5 秒触发一次
+            )
+
+    bind_preview_events([input_text_single, max_text_tokens_per_sentence, auto_preview])
     
     # 手动预览按钮
     preview_button.click(
-        manual_preview,
+        lambda text, max_tokens: cached_tokenize_and_split(text, max_tokens),
         inputs=[input_text_single, max_text_tokens_per_sentence],
         outputs=[sentences_preview]
     )
-    
-    prompt_audio.upload(update_prompt_audio,
-                        inputs=[],
-                        outputs=[gen_button])
 
     gen_button.click(gen_single,
                      inputs=[prompt_audio, input_text_single, infer_mode,
